@@ -1,0 +1,131 @@
+version: '3.8'
+
+networks:
+  app-network:
+    driver: bridge
+
+services:
+  materialized:
+    image: materialize/materialized:latest
+    ports:
+      - "6875:6875"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6875"]
+      interval: 1s
+      start_period: 30s
+    networks:
+      - app-network
+
+  mongodb:
+    image: mongo:5.0
+    ports:
+      - "27017:27017"
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "mongo", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 1s
+      start_period: 60s
+
+  mongo-init:
+    image: mongo:5.0
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - ./mongodb/init_mongo.sh:/init_mongo.sh.sh
+    networks:
+      - app-network
+    entrypoint: ["/bin/bash", "-c", "chmod +x /init_mongo.sh.sh && /init_mongo.sh.sh"]
+    healthcheck:
+      test: ["CMD", "mongo", "--host", "mongodb", "--eval", "printjson(rs.status())"]
+      interval: 5s
+      retries: 5
+      start_period: 30s
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    environment:
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_NODE_ID: 1
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CONFLUENT_SUPPORT_METRICS_ENABLE: "false"
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    ports:
+      - "9092:9092"
+    volumes:
+      - /tmp/kraft-composed-logs:/var/lib/kafka/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 1s
+      start_period: 120s
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    environment:
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://schema-registry:8081,http://localhost:8081
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081"]
+      interval: 1s
+      start_period: 120s
+    networks:
+      - app-network
+
+  debezium:
+    image: debezium/connect:1.8
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: "1"
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083"]
+      interval: 1s
+      start_period: 120s
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  debezium_deploy:
+    image: debezium/connect:1.8
+    depends_on:
+      mongo-init:
+        condition: service_healthy
+      debezium:
+        condition: service_healthy
+    environment:
+      KAFKA_ADDR: kafka:9092
+    volumes:
+      - ./mongodb/init_debezium.sh:/init_debezium.sh
+    networks:
+      - app-network
+    entrypoint: ["/bin/bash", "-c", "chmod +x /init_debezium.sh && /init_debezium.sh"]
+
+  
